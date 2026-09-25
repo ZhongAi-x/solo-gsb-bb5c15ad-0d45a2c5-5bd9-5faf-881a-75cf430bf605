@@ -1635,8 +1635,18 @@ curl -X POST http://localhost:8000/api/reference-diagnostics \
 - **循环链**：定义节点取自身 `$ref` 优先的代表出边追踪成环，树节点
   内部属性引用自身定义形成自环（`["#/$defs/Node", "#/$defs/Node"]`），
   根侧节点引用 `#` 报告为回边；同一环只出现一次，结果与输入键顺序无关；
-- `enum` / `const` / `default` / `examples` 中的 `$ref` 是**实例数据**，
-  不计入引用图。
+- **遍历边界（引用与定义共用）**：只沿 JSON Schema 的子 schema 关键字
+  递归——定义容器 `$defs` / `definitions`（draft-04/06/07），对象规则
+  `properties` / `patternProperties` / `additionalProperties` /
+  `unevaluatedProperties` / `propertyNames` / `dependentSchemas`，数组规则
+  `items`（schema 与 draft-04 元组数组两种形态）/ `additionalItems` /
+  `unevaluatedItems` / `contains` / `prefixItems`，组合与条件分支
+  `allOf` / `anyOf` / `oneOf` / `not` / `if` / `then` / `else`，以及
+  `dependencies` 中取值为对象的 schema 依赖；
+- **实例数据与扩展不下钻**：`enum` / `const` / `default` / `examples`
+  及普通注解、校验关键字值中的 `$ref` 是**实例数据**，不计入引用图；
+  `x-` 等未知扩展值整体视为数据——其内部同名字段（包括 `$ref`、
+  `$defs` / `definitions`）都不会产生伪引用边、伪无效引用或伪死定义。
 
 提交的 schema 本身不合法时返回 `400`（与创建分析一致）；缺少 `schema`
 字段或其值不是 JSON 对象时返回 `422`。该接口不产生任何持久化记录，

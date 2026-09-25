@@ -26,8 +26,27 @@ $defs 节点之外（根侧结构）时，其精确指向的定义节点是可�
   "环上最小指针旋转到链首"规范化去重；根侧节点引用文档根（``#``）
   形成的自环单独报告。
 
-其余约定：``enum`` / ``const`` / ``default`` / ``examples`` 中出现的
-``$ref`` 是实例数据而非 schema 引用，遍历时不下钻；整个过程只在入参
+遍历边界
+========
+引用与定义的收集共用同一套 schema 树遍历，**只沿 JSON Schema 的子
+schema 关键字递归**：
+
+* 定义容器：``$defs`` / ``definitions``（draft-04/06/07），其每个命名
+  成员是子 schema，成员内部继续递归（故嵌套 ``$defs`` 仍被识别）；
+* 对象规则：``properties`` / ``patternProperties`` /
+  ``dependentSchemas``（按命名映射的子 schema）、
+  ``additionalProperties`` / ``unevaluatedProperties`` / ``propertyNames``；
+* 数组规则：``items``（schema 或 draft-04 元组数组两种形态）、
+  ``additionalItems`` / ``unevaluatedItems`` / ``contains``；
+* 组合与条件分支：``allOf`` / ``anyOf`` / ``oneOf``（子 schema 数组）、
+  ``not``、``if`` / ``then`` / ``else``；
+* draft-04/06/07 的 ``dependencies``：成员为数组时是属性名依赖（数据），
+  成员为对象时才是子 schema。
+
+除此之外的关键字值一律视为**实例数据 / 注解 / 未知扩展**，不下钻：
+``const`` / ``enum`` / ``default`` / ``examples``、``type`` /
+``required`` / ``title`` 等普通注解，以及 ``x-`` 开头的任意扩展——
+其内部同名字段（``$ref``、``$defs`` 等）都只是数据。整个过程只在入参
 文档内存结构内解析，绝不发起网络或文件系统访问。
 """
 from __future__ import annotations
@@ -36,8 +55,32 @@ from collections import deque
 from typing import Any
 from urllib.parse import unquote
 
-# 实例数据关键字：其内部的 $ref 是数据，不是 schema 引用
-_INSTANCE_KEYWORDS = frozenset({"enum", "const", "default", "examples"})
+# 定义容器关键字：值为「名称 -> 子 schema」映射
+_DEFINITION_KEYWORDS = frozenset({"$defs", "definitions"})
+
+# 值本身就是一个子 schema 的关键字
+_SINGLE_SUBSCHEMA_KEYWORDS = frozenset({
+    "additionalProperties",
+    "unevaluatedProperties",
+    "propertyNames",
+    "additionalItems",
+    "unevaluatedItems",
+    "contains",
+    "not",
+    "if",
+    "then",
+    "else",
+})
+
+# 值为「名称 -> 子 schema」映射的关键字
+_SUBSCHEMA_MAP_KEYWORDS = frozenset({
+    "properties",
+    "patternProperties",
+    "dependentSchemas",
+})
+
+# 值为子 schema 数组的关键字
+_SUBSCHEMA_ARRAY_KEYWORDS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
 
 # 不可用引用的原因代码
 REASON_EXTERNAL = "external_reference"
@@ -184,71 +227,158 @@ def _classify_ref(root: Any, ref: Any) -> tuple[str | None, dict | None]:
 
 
 # ---------------------------------------------------------------------------
-# Schema 树遍历：收集 $defs 节点、引用边与不可用引用
+# Schema 树遍历：只沿子 schema 关键字递归，收集 $defs 节点、引用边与无效引用
 # ---------------------------------------------------------------------------
 
 
-def _walk_defs(node: Any, pointer: str, def_nodes: list[dict]) -> None:
-    """收集全部 ``$defs`` 容器中的命名定义节点。
+def _join(pointer: str, *tokens: str) -> str:
+    """把已解码路径段依次拼到父指针之后（根指针为 ``#``）。"""
+    suffix = "/".join(_escape_token(token) for token in tokens)
+    return f"#/{suffix}" if pointer == "#" else f"{pointer}/{suffix}"
 
-    记录 ``pointer`` / ``name`` / ``top_level``（是否为文档根
-    ``#/$defs`` 的直接子节点；定义内部嵌套 $defs 的子节点为 False）。
+
+def _collect_definitions(
+    schema: Any,
+    pointer: str,
+    top_level: bool,
+    def_nodes: list[dict],
+) -> None:
+    """登记 ``schema`` **本层**定义容器（``$defs`` / ``definitions``）的成员。
+
+    只登记直接命名成员；成员内部嵌套的容器在该成员被递归遍历时自行登记，
+    以保证每个定义节点恰好登记一次。``top_level`` 仅对文档根直接下属的
+    容器成员为 True。
     """
-    if isinstance(node, dict):
-        defs = node.get("$defs")
-        if isinstance(defs, dict):
-            defs_pointer = "#/$defs" if pointer == "#" else f"{pointer}/$defs"
-            top_level = pointer == "#"
-            for name, child in defs.items():
-                child_pointer = f"{defs_pointer}/{_escape_token(name)}"
-                def_nodes.append(
-                    {"pointer": child_pointer, "name": name, "top_level": top_level}
-                )
-                _walk_defs(child, child_pointer, def_nodes)
-        for key, value in node.items():
-            if key == "$defs" and isinstance(value, dict):
-                continue
-            child_pointer = (
-                f"#/{_escape_token(key)}"
-                if pointer == "#"
-                else f"{pointer}/{_escape_token(key)}"
+    if not isinstance(schema, dict):
+        return
+    for container in _DEFINITION_KEYWORDS:
+        defs = schema.get(container)
+        if not isinstance(defs, dict):
+            continue
+        for name in defs:
+            def_nodes.append(
+                {
+                    "pointer": _join(pointer, container, name),
+                    "name": name,
+                    "top_level": top_level,
+                }
             )
-            _walk_defs(value, child_pointer, def_nodes)
-    elif isinstance(node, list):
-        for index, item in enumerate(node):
-            _walk_defs(item, f"{pointer}/{index}", def_nodes)
 
 
-def _walk(
-    node: Any,
+def _walk_schema(
+    schema: Any,
     pointer: str,
     root: Any,
+    def_nodes: list[dict],
     edges: list[dict],
     invalid_refs: list[dict],
 ) -> None:
-    """递归遍历 schema 树，收集引用边与不可用引用（实例数据关键字跳过）。"""
-    if isinstance(node, dict):
-        for key, value in node.items():
-            if key in _INSTANCE_KEYWORDS:
-                # enum / const / default / examples 内的 $ref 是实例数据
-                continue
-            child_pointer = (
-                f"#/{_escape_token(key)}"
-                if pointer == "#"
-                else f"{pointer}/{_escape_token(key)}"
-            )
-            if key == "$ref":
-                target, invalid = _classify_ref(root, value)
-                if invalid is not None:
-                    invalid_refs.append({"source": pointer, **invalid})
-                else:
-                    edges.append({"source": pointer, "ref": value, "target": target})
-                # $ref 的取值本身（字符串）不是 schema 节点，不再下钻
-                continue
-            _walk(value, child_pointer, root, edges, invalid_refs)
-    elif isinstance(node, list):
-        for index, item in enumerate(node):
-            _walk(item, f"{pointer}/{index}", root, edges, invalid_refs)
+    """沿 JSON Schema 子 schema 关键字递归，统一收集定义节点与引用。
+
+    只递归白名单内的子 schema 关键字；``const`` / ``enum`` / ``default``
+    / ``examples`` 等实例数据及 ``x-`` 等未知扩展值整体视为数据，不下钻
+    ——其中同名字段（``$ref``、``$defs`` 等）不会产生伪引用或伪定义。
+    布尔 schema（``true`` / ``false``）是叶子，无子结构。
+    """
+    if not isinstance(schema, dict):
+        return
+
+    # 先登记本层定义容器（容器本身不是引用位置，其成员仍是子 schema）
+    _collect_definitions(schema, pointer, pointer == "#", def_nodes)
+
+    for key, value in schema.items():
+        child_pointer = _join(pointer, key)
+
+        if key == "$ref":
+            target, invalid = _classify_ref(root, value)
+            if invalid is not None:
+                invalid_refs.append({"source": pointer, **invalid})
+            else:
+                edges.append({"source": pointer, "ref": value, "target": target})
+            # $ref 的取值本身（字符串）不是 schema 节点，不再下钻
+            continue
+
+        if key in _DEFINITION_KEYWORDS:
+            # 命名成员已在 _collect_definitions 中登记；继续递归成员子树
+            if isinstance(value, dict):
+                for name, member in value.items():
+                    _walk_schema(
+                        member,
+                        _join(pointer, key, name),
+                        root,
+                        def_nodes,
+                        edges,
+                        invalid_refs,
+                    )
+            continue
+
+        if key in _SINGLE_SUBSCHEMA_KEYWORDS:
+            _walk_schema(value, child_pointer, root, def_nodes, edges, invalid_refs)
+            continue
+
+        if key in _SUBSCHEMA_MAP_KEYWORDS:
+            if isinstance(value, dict):
+                for name, member in value.items():
+                    _walk_schema(
+                        member,
+                        _join(pointer, key, name),
+                        root,
+                        def_nodes,
+                        edges,
+                        invalid_refs,
+                    )
+            continue
+
+        if key in _SUBSCHEMA_ARRAY_KEYWORDS:
+            if isinstance(value, list):
+                for index, member in enumerate(value):
+                    _walk_schema(
+                        member,
+                        f"{child_pointer}/{index}",
+                        root,
+                        def_nodes,
+                        edges,
+                        invalid_refs,
+                    )
+            continue
+
+        if key == "items":
+            # schema 形态（draft 2020-12 / 单元素 items）与
+            # draft-04/06/07 元组形态（子 schema 数组）都要递归
+            if isinstance(value, list):
+                for index, member in enumerate(value):
+                    _walk_schema(
+                        member,
+                        f"{child_pointer}/{index}",
+                        root,
+                        def_nodes,
+                        edges,
+                        invalid_refs,
+                    )
+            else:
+                _walk_schema(
+                    value, child_pointer, root, def_nodes, edges, invalid_refs
+                )
+            continue
+
+        if key == "dependencies":
+            # draft-04/06/07：成员为数组 = 属性名依赖（数据，跳过）；
+            # 成员为 schema（对象或布尔）= schema 依赖（子 schema）
+            if isinstance(value, dict):
+                for name, member in value.items():
+                    if isinstance(member, (dict, bool)):
+                        _walk_schema(
+                            member,
+                            _join(pointer, "dependencies", name),
+                            root,
+                            def_nodes,
+                            edges,
+                            invalid_refs,
+                        )
+            continue
+
+        # 其余关键字（const / enum / default / examples、普通注解、
+        # type / required 及 x- 未知扩展等）的值都是数据，不下钻。
 
 
 # ---------------------------------------------------------------------------
@@ -381,8 +511,7 @@ def analyze_references(schema: dict[str, Any]) -> dict:
     invalid_refs: list[dict] = []
     def_nodes: list[dict] = []
 
-    _walk_defs(schema, "#", def_nodes)
-    _walk(schema, "#", schema, edges, invalid_refs)
+    _walk_schema(schema, "#", schema, def_nodes, edges, invalid_refs)
 
     edges.sort(key=lambda edge: (edge["source"], edge["target"]))
     invalid_refs.sort(key=lambda item: (item["source"], str(item.get("ref") or "")))

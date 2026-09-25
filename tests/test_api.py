@@ -1497,6 +1497,33 @@ def test_reference_diagnostics_validation_errors(client):
     assert client.post("/api/reference-diagnostics", json={"schema": []}).status_code == 422
 
 
+def test_reference_diagnostics_ignores_extension_data(client):
+    # x- 扩展对象里的 $ref 与嵌套 $defs 是数据而非 schema：不产生
+    # 无效引用（#/missing）也不产生死定义（Ghost）
+    resp = client.post("/api/reference-diagnostics", json={
+        "schema": {
+            "type": "object",
+            "properties": {"a": {"$ref": "#/$defs/A"}},
+            "x-meta": {
+                "$ref": "#/missing",
+                "nested": {"$defs": {"Ghost": {"type": "integer"}}},
+            },
+            "$defs": {"A": {"type": "string"}},
+        }
+    })
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["counts"] == {
+        "refs": 1, "edges": 1, "invalid_refs": 0,
+        "unreachable_defs": 0, "cycles": 0,
+    }
+    assert data["invalid_refs"] == []
+    assert data["unreachable_defs"] == []
+    assert data["edges"] == [
+        {"source": "#/properties/a", "ref": "#/$defs/A", "target": "#/$defs/A"}
+    ]
+
+
 def test_reference_diagnostics_is_readonly(client):
     before = client.get("/api/analyses").json()["total"]
     resp = client.post("/api/reference-diagnostics", json={"schema": REF_DIAG_SCHEMA})

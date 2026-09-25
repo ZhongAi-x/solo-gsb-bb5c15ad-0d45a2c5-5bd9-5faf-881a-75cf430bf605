@@ -58,6 +58,121 @@ class TestEmptyAndSimple:
         assert result["invalid_refs"] == []
         assert unreachable_names(result) == ["A"]
 
+    def test_unknown_extension_values_are_data(self):
+        # x- 扩展（及其任意嵌套、数组元素）里的 $ref / $defs 同名字段都是数据：
+        # 既不产生无效引用（#/missing），也不产生死定义（Ghost）
+        schema = {
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "x-meta": {
+                "$ref": "#/missing",
+                "nested": {"$defs": {"Ghost": {"type": "integer"}}},
+                "list": [{"$ref": "#/also-missing"}],
+            },
+            "x-other": [{"$ref": "http://example.com/x"}],
+        }
+        result = analyze_references(schema)
+        assert result["edges"] == []
+        assert result["invalid_refs"] == []
+        assert result["unreachable_defs"] == []
+        assert result["cycles"] == []
+        assert result["counts"] == {
+            "refs": 0, "edges": 0, "invalid_refs": 0,
+            "unreachable_defs": 0, "cycles": 0,
+        }
+
+    def test_data_like_keywords_never_descend(self):
+        # 普通注解 / 校验关键字值内的同名字段同样是数据
+        schema = {
+            "title": {"$ref": "#/missing"},
+            "required": [{"$ref": "#/missing"}],
+            "type": [{"$defs": {"Ghost": {}}}],
+            "description": {"$ref": "#/missing"},
+            "const": {"$defs": {"Ghost": {}}},
+            "enum": [[{"$ref": "#/x"}]],
+            "default": {"$ref": "#/y"},
+            "examples": [{"$ref": "#/z"}],
+        }
+        result = analyze_references(schema)
+        assert result["counts"]["refs"] == 0
+        assert result["invalid_refs"] == []
+        assert result["unreachable_defs"] == []
+
+    def test_real_subschema_keywords_still_traversed(self):
+        # 真正的子 schema 关键字（对象 / 数组规则、组合、条件分支）内的
+        # 引用边照常收集，目标定义可达
+        schema = {
+            "properties": {"a": {"$ref": "#/$defs/A"}},
+            "patternProperties": {"^x": {"$ref": "#/$defs/B"}},
+            "additionalProperties": {"$ref": "#/$defs/C"},
+            "propertyNames": {"$ref": "#/$defs/D"},
+            "allOf": [{"$ref": "#/$defs/E"}],
+            "anyOf": [{"$ref": "#/$defs/F"}],
+            "oneOf": [{"$ref": "#/$defs/G"}],
+            "not": {"$ref": "#/$defs/H"},
+            "if": {"$ref": "#/$defs/I"},
+            "then": {"$ref": "#/$defs/J"},
+            "else": {"$ref": "#/$defs/K"},
+            "items": {"$ref": "#/$defs/L"},
+            "additionalItems": {"$ref": "#/$defs/M"},
+            "contains": {"$ref": "#/$defs/N"},
+            "unevaluatedProperties": {"$ref": "#/$defs/O"},
+            "unevaluatedItems": {"$ref": "#/$defs/P"},
+            "prefixItems": [{"$ref": "#/$defs/Q"}],
+            "dependencies": {"s": ["a"], "t": {"$ref": "#/$defs/R"}},
+            "dependentSchemas": {"u": {"$ref": "#/$defs/S"}},
+            "$defs": {name: {"type": "string"} for name in "ABCDEFGHIJKLMNOPQRS"},
+        }
+        result = analyze_references(schema)
+        assert result["invalid_refs"] == []
+        assert len(result["edges"]) == 19
+        assert result["unreachable_defs"] == []
+
+    def test_items_tuple_form_is_traversed(self):
+        # draft-04/06/07 items 元组形态：数组元素是子 schema
+        schema = {
+            "items": [{"type": "string"}, {"$ref": "#/$defs/A"}],
+            "$defs": {"A": True, "Ghost": True},
+        }
+        result = analyze_references(schema)
+        assert ("#/items/1", "#/$defs/A") in edge_set(result)
+        assert unreachable_names(result) == ["Ghost"]
+
+    def test_draft04_definitions_container_supported(self):
+        schema = {
+            "properties": {"a": {"$ref": "#/definitions/A"}},
+            "definitions": {
+                "A": {"type": "string"},
+                "nested": {"definitions": {"Inner": {"type": "null"}}},
+            },
+        }
+        result = analyze_references(schema)
+        assert ("#/properties/a", "#/definitions/A") in edge_set(result)
+        assert unreachable_names(result) == ["nested", "Inner"]
+
+    def test_extension_data_does_not_mask_real_diagnostics(self):
+        # 同一 schema 中：扩展数据被忽略，真实子 schema 的无效引用、
+        # 死定义与循环仍被准确报告
+        schema = {
+            "type": "object",
+            "properties": {
+                "a": {"$ref": "#/$defs/A"},
+                "bad": {"$ref": "#/$defs/Missing"},
+            },
+            "x-meta": {"$ref": "#/missing", "$defs": {"Ghost": {}}},
+            "$defs": {
+                "A": {"$ref": "#/$defs/Loop"},
+                "Loop": {"$ref": "#/$defs/A"},
+                "Orphan": True,
+            },
+        }
+        result = analyze_references(schema)
+        assert invalid_map(result) == {"#/properties/bad": "target_not_found"}
+        assert unreachable_names(result) == ["Orphan"]
+        assert cycle_chains(result) == [
+            ["#/$defs/A", "#/$defs/Loop", "#/$defs/A"]
+        ]
+
 
 class TestEdgesAndResolution:
     def test_basic_local_refs_into_defs(self):
