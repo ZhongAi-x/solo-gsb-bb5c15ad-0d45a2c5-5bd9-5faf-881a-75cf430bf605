@@ -58,6 +58,89 @@ class TestEmptyAndSimple:
         assert result["invalid_refs"] == []
         assert unreachable_names(result) == ["A"]
 
+    def test_refs_and_defs_inside_unknown_extensions_are_ignored(self):
+        # x-meta 等未知扩展的值是数据：其中同名的 $ref / $defs 不产生
+        # 引用边、无效引用或死定义
+        schema = {
+            "type": "object",
+            "properties": {"name": {"$ref": "#/$defs/Name"}},
+            "x-meta": {
+                "$ref": "#/missing",
+                "$defs": {"Ghost": {"type": "string"}},
+            },
+            "$defs": {"Name": {"type": "string"}},
+        }
+        result = analyze_references(schema)
+        assert edge_set(result) == {("#/properties/name", "#/$defs/Name")}
+        assert result["invalid_refs"] == []
+        assert result["unreachable_defs"] == []
+        assert result["cycles"] == []
+
+    def test_deeply_nested_extension_values_are_data(self):
+        # 扩展值内部任意深度（数组 / 对象嵌套）的同名字段同样不下钻
+        schema = {
+            "properties": {
+                "a": {
+                    "x-deep": [
+                        {"$ref": "#/missing"},
+                        {"nested": {"$defs": {"Ghost": True}}},
+                    ],
+                    "default": {"$defs": {"AlsoData": True}},
+                }
+            }
+        }
+        result = analyze_references(schema)
+        assert result["edges"] == []
+        assert result["invalid_refs"] == []
+        assert result["unreachable_defs"] == []
+
+    def test_refs_in_all_subschema_keywords_are_found(self):
+        # 定义容器 / 对象与数组规则 / 组合 / 条件分支内的真实引用全部收集
+        schema = {
+            "properties": {"p": {"$ref": "#/$defs/A"}},
+            "patternProperties": {"^x": {"$ref": "#/$defs/A"}},
+            "additionalProperties": {"$ref": "#/$defs/A"},
+            "propertyNames": {"$ref": "#/$defs/A"},
+            "unevaluatedProperties": {"$ref": "#/$defs/A"},
+            "dependentSchemas": {"d": {"$ref": "#/$defs/A"}},
+            "items": {"$ref": "#/$defs/A"},
+            "prefixItems": [{"$ref": "#/$defs/A"}],
+            "additionalItems": {"$ref": "#/$defs/A"},
+            "contains": {"$ref": "#/$defs/A"},
+            "unevaluatedItems": {"$ref": "#/$defs/A"},
+            "allOf": [{"$ref": "#/$defs/A"}],
+            "anyOf": [{"$ref": "#/$defs/A"}],
+            "oneOf": [{"$ref": "#/$defs/A"}],
+            "not": {"$ref": "#/$defs/A"},
+            "if": {"$ref": "#/$defs/A"},
+            "then": {"$ref": "#/$defs/A"},
+            "else": {"$ref": "#/$defs/A"},
+            "definitions": {"Legacy": {"$ref": "#/$defs/A"}},
+            "$defs": {"A": {"type": "string"}},
+        }
+        result = analyze_references(schema)
+        sources = {e["source"] for e in result["edges"]}
+        assert sources == {
+            "#/properties/p", "#/patternProperties/^x",
+            "#/additionalProperties", "#/propertyNames",
+            "#/unevaluatedProperties", "#/dependentSchemas/d",
+            "#/items", "#/prefixItems/0", "#/additionalItems", "#/contains",
+            "#/unevaluatedItems", "#/allOf/0", "#/anyOf/0", "#/oneOf/0",
+            "#/not", "#/if", "#/then", "#/else", "#/definitions/Legacy",
+        }
+        assert result["invalid_refs"] == []
+        assert result["unreachable_defs"] == []
+
+    def test_legacy_tuple_items_are_traversed(self):
+        # draft-04/06/07 的 items 元组写法：每个元素都是子 schema
+        schema = {
+            "items": [{"$ref": "#/$defs/A"}, {"type": "integer"}],
+            "$defs": {"A": {"type": "string"}},
+        }
+        result = analyze_references(schema)
+        assert ("#/items/0", "#/$defs/A") in edge_set(result)
+        assert result["unreachable_defs"] == []
+
 
 class TestEdgesAndResolution:
     def test_basic_local_refs_into_defs(self):

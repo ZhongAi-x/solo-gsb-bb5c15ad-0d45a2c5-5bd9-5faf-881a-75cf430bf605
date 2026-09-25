@@ -1484,6 +1484,32 @@ def test_reference_diagnostics_clean_schema(client):
     assert [d["name"] for d in data["unreachable_defs"]] == ["Orphan"]
 
 
+def test_reference_diagnostics_ignores_extension_values(client):
+    # x-meta 扩展对象里的 $ref / $defs 是数据，不产生伪无效引用与伪死定义
+    resp = client.post("/api/reference-diagnostics", json={
+        "schema": {
+            "type": "object",
+            "properties": {"name": {"$ref": "#/$defs/Name"}},
+            "x-meta": {
+                "$ref": "#/missing",
+                "$defs": {"Ghost": {"type": "string"}},
+            },
+            "$defs": {"Name": {"type": "string"}},
+        }
+    })
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["counts"] == {
+        "refs": 1, "edges": 1, "invalid_refs": 0,
+        "unreachable_defs": 0, "cycles": 0,
+    }
+    assert [(e["source"], e["target"]) for e in data["edges"]] == [
+        ("#/properties/name", "#/$defs/Name")
+    ]
+    assert data["invalid_refs"] == []
+    assert data["unreachable_defs"] == []
+
+
 def test_reference_diagnostics_rejects_invalid_schema_with_400(client):
     resp = client.post("/api/reference-diagnostics", json={"schema": {"type": "nope"}})
     assert resp.status_code == 400

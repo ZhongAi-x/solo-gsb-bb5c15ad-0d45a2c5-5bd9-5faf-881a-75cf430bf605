@@ -1635,8 +1635,15 @@ curl -X POST http://localhost:8000/api/reference-diagnostics \
 - **循环链**：定义节点取自身 `$ref` 优先的代表出边追踪成环，树节点
   内部属性引用自身定义形成自环（`["#/$defs/Node", "#/$defs/Node"]`），
   根侧节点引用 `#` 报告为回边；同一环只出现一次，结果与输入键顺序无关；
-- `enum` / `const` / `default` / `examples` 中的 `$ref` 是**实例数据**，
-  不计入引用图。
+- **遍历边界**：引用与定义收集只沿 JSON Schema 的子 schema 关键字下钻
+  （定义容器 `$defs` / `definitions`，对象规则 `properties` /
+  `patternProperties` / `dependentSchemas` / `additionalProperties` /
+  `propertyNames` / `unevaluatedProperties`，数组规则 `items` /
+  `prefixItems` / `additionalItems` / `contains` / `unevaluatedItems`，
+  组合 `allOf` / `anyOf` / `oneOf` / `not` 与条件分支 `if` / `then` /
+  `else`）；`enum` / `const` / `default` / `examples` 等实例数据关键字
+  与 `x-*` 等未知扩展的取值一律视作**数据**——其中同名的 `$ref` /
+  `$defs` 字段不计入引用图，也不会产生无效引用或死定义条目。
 
 提交的 schema 本身不合法时返回 `400`（与创建分析一致）；缺少 `schema`
 字段或其值不是 JSON 对象时返回 `422`。该接口不产生任何持久化记录，

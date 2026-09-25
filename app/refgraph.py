@@ -26,18 +26,43 @@ $defs 节点之外（根侧结构）时，其精确指向的定义节点是可�
   "环上最小指针旋转到链首"规范化去重；根侧节点引用文档根（``#``）
   形成的自环单独报告。
 
-其余约定：``enum`` / ``const`` / ``default`` / ``examples`` 中出现的
-``$ref`` 是实例数据而非 schema 引用，遍历时不下钻；整个过程只在入参
-文档内存结构内解析，绝不发起网络或文件系统访问。
+其余约定：遍历只沿 JSON Schema 的**子 schema 关键字**下钻（定义容器
+``$defs`` / ``definitions``，对象规则 ``properties`` /
+``patternProperties`` / ``dependentSchemas`` / ``additionalProperties``
+/ ``propertyNames`` / ``unevaluatedProperties``，数组规则 ``items`` /
+``prefixItems`` / ``additionalItems`` / ``contains`` /
+``unevaluatedItems``，组合 ``allOf`` / ``anyOf`` / ``oneOf`` / ``not``
+与条件分支 ``if`` / ``then`` / ``else``）；``enum`` / ``const`` /
+``default`` / ``examples`` 等实例数据关键字与 ``x-*`` 等未知扩展的
+取值一律视作数据，其中同名的 ``$ref`` / ``$defs`` 字段不计入诊断。
+整个过程只在入参文档内存结构内解析，绝不发起网络或文件系统访问。
 """
 from __future__ import annotations
 
 from collections import deque
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import unquote
 
-# 实例数据关键字：其内部的 $ref 是数据，不是 schema 引用
-_INSTANCE_KEYWORDS = frozenset({"enum", "const", "default", "examples"})
+# 子 schema 关键字：引用与定义遍历只沿这些关键字下钻，
+# 其余关键字（断言、注解、实例数据与 x-* 未知扩展）的值一律视作数据
+
+# 值为单个子 schema 的关键字（对象 / 数组规则与组合、条件分支）
+_SUBSCHEMA_VALUE_KEYWORDS = frozenset({
+    "additionalProperties", "unevaluatedProperties", "propertyNames",
+    "items", "additionalItems", "unevaluatedItems", "contains",
+    "not", "if", "then", "else",
+})
+
+# 值为子 schema 数组的关键字（组合分支与元组规则）
+_SUBSCHEMA_ARRAY_KEYWORDS = frozenset({
+    "allOf", "anyOf", "oneOf", "prefixItems",
+})
+
+# 值为 "名称 -> 子 schema" 映射的关键字（定义容器与对象规则）
+_SUBSCHEMA_MAP_KEYWORDS = frozenset({
+    "$defs", "definitions",
+    "properties", "patternProperties", "dependentSchemas",
+})
 
 # 不可用引用的原因代码
 REASON_EXTERNAL = "external_reference"
@@ -188,35 +213,69 @@ def _classify_ref(root: Any, ref: Any) -> tuple[str | None, dict | None]:
 # ---------------------------------------------------------------------------
 
 
+def _subschema_children(node: Any, pointer: str) -> Iterator[tuple[str, str, Any]]:
+    """产出 ``node`` 需递归下钻的 ``(关键字, 子节点指针, 子 schema)``。
+
+    引用与定义遍历共用同一边界：只沿 JSON Schema 的子 schema 关键字
+    下钻——定义容器（``$defs`` / ``definitions``）、对象与数组规则
+    （``properties`` / ``patternProperties`` / ``dependentSchemas`` /
+    ``additionalProperties`` / ``propertyNames`` /
+    ``unevaluatedProperties`` / ``items`` / ``prefixItems`` /
+    ``additionalItems`` / ``contains`` / ``unevaluatedItems``）、组合
+    （``allOf`` / ``anyOf`` / ``oneOf`` / ``not``）与条件分支
+    （``if`` / ``then`` / ``else``）。其余关键字（``type`` / ``required``
+    等断言，``enum`` / ``const`` / ``default`` / ``examples`` 等实例
+    数据，以及 ``x-*`` 等未知扩展）的值一律视作数据，不下钻。
+    """
+    if not isinstance(node, dict):
+        return
+    for key, value in node.items():
+        child_pointer = (
+            f"#/{_escape_token(key)}"
+            if pointer == "#"
+            else f"{pointer}/{_escape_token(key)}"
+        )
+        if key in _SUBSCHEMA_MAP_KEYWORDS:
+            if isinstance(value, dict):
+                for name, subschema in value.items():
+                    yield key, f"{child_pointer}/{_escape_token(name)}", subschema
+        elif key in _SUBSCHEMA_ARRAY_KEYWORDS:
+            if isinstance(value, list):
+                for index, subschema in enumerate(value):
+                    yield key, f"{child_pointer}/{index}", subschema
+        elif key in _SUBSCHEMA_VALUE_KEYWORDS:
+            if isinstance(value, list):
+                # 旧版 items 的元组写法：数组每个元素都是子 schema
+                for index, subschema in enumerate(value):
+                    yield key, f"{child_pointer}/{index}", subschema
+            else:
+                yield key, child_pointer, value
+
+
 def _walk_defs(node: Any, pointer: str, def_nodes: list[dict]) -> None:
     """收集全部 ``$defs`` 容器中的命名定义节点。
 
     记录 ``pointer`` / ``name`` / ``top_level``（是否为文档根
     ``#/$defs`` 的直接子节点；定义内部嵌套 $defs 的子节点为 False）。
+    遍历边界与 ``_walk`` 一致：只沿子 schema 关键字下钻，未知扩展
+    对象里同名的 ``$defs`` 字段是数据，不产生定义节点。
     """
-    if isinstance(node, dict):
-        defs = node.get("$defs")
-        if isinstance(defs, dict):
-            defs_pointer = "#/$defs" if pointer == "#" else f"{pointer}/$defs"
-            top_level = pointer == "#"
-            for name, child in defs.items():
-                child_pointer = f"{defs_pointer}/{_escape_token(name)}"
-                def_nodes.append(
-                    {"pointer": child_pointer, "name": name, "top_level": top_level}
-                )
-                _walk_defs(child, child_pointer, def_nodes)
-        for key, value in node.items():
-            if key == "$defs" and isinstance(value, dict):
-                continue
-            child_pointer = (
-                f"#/{_escape_token(key)}"
-                if pointer == "#"
-                else f"{pointer}/{_escape_token(key)}"
+    if not isinstance(node, dict):
+        return
+    defs = node.get("$defs")
+    if isinstance(defs, dict):
+        defs_pointer = "#/$defs" if pointer == "#" else f"{pointer}/$defs"
+        top_level = pointer == "#"
+        for name, child in defs.items():
+            child_pointer = f"{defs_pointer}/{_escape_token(name)}"
+            def_nodes.append(
+                {"pointer": child_pointer, "name": name, "top_level": top_level}
             )
-            _walk_defs(value, child_pointer, def_nodes)
-    elif isinstance(node, list):
-        for index, item in enumerate(node):
-            _walk_defs(item, f"{pointer}/{index}", def_nodes)
+            _walk_defs(child, child_pointer, def_nodes)
+    for key, child_pointer, child in _subschema_children(node, pointer):
+        if key == "$defs":
+            continue  # $defs 子节点已在上面登记并递归
+        _walk_defs(child, child_pointer, def_nodes)
 
 
 def _walk(
@@ -226,29 +285,21 @@ def _walk(
     edges: list[dict],
     invalid_refs: list[dict],
 ) -> None:
-    """递归遍历 schema 树，收集引用边与不可用引用（实例数据关键字跳过）。"""
-    if isinstance(node, dict):
-        for key, value in node.items():
-            if key in _INSTANCE_KEYWORDS:
-                # enum / const / default / examples 内的 $ref 是实例数据
-                continue
-            child_pointer = (
-                f"#/{_escape_token(key)}"
-                if pointer == "#"
-                else f"{pointer}/{_escape_token(key)}"
-            )
-            if key == "$ref":
-                target, invalid = _classify_ref(root, value)
-                if invalid is not None:
-                    invalid_refs.append({"source": pointer, **invalid})
-                else:
-                    edges.append({"source": pointer, "ref": value, "target": target})
-                # $ref 的取值本身（字符串）不是 schema 节点，不再下钻
-                continue
-            _walk(value, child_pointer, root, edges, invalid_refs)
-    elif isinstance(node, list):
-        for index, item in enumerate(node):
-            _walk(item, f"{pointer}/{index}", root, edges, invalid_refs)
+    """递归遍历子 schema，收集引用边与不可用引用。
+
+    只沿子 schema 关键字下钻（与 ``_walk_defs`` 同一边界）；
+    ``$ref`` 在当前节点直接分类，其字符串取值本身不是 schema 节点。
+    """
+    if not isinstance(node, dict):
+        return
+    if "$ref" in node:
+        target, invalid = _classify_ref(root, node["$ref"])
+        if invalid is not None:
+            invalid_refs.append({"source": pointer, **invalid})
+        else:
+            edges.append({"source": pointer, "ref": node["$ref"], "target": target})
+    for _, child_pointer, child in _subschema_children(node, pointer):
+        _walk(child, child_pointer, root, edges, invalid_refs)
 
 
 # ---------------------------------------------------------------------------
